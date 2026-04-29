@@ -9,11 +9,15 @@ from datetime import datetime
 import glob
 import gc
 import time
+import argparse
+import json
+
 # import spaces         # only for web demo
 
 from pi3.utils.geometry import se3_inverse, homogenize_points, depth_edge
 from pi3.models.pi3 import Pi3
-from pi3.utils.basic import load_images_as_tensor
+from pi3.models.pi3x import Pi3X
+from pi3.utils.basic import load_images_as_tensor, load_multimodal_data
 
 import trimesh
 import matplotlib
@@ -266,11 +270,117 @@ def compute_camera_faces(cone_shape: trimesh.Trimesh) -> np.ndarray:
     return np.array(faces_list)
 
 
+def _normalize_path(path: str) -> str:
+    return os.path.normpath(path).replace('\\', '/').lower()
+
+
+def _find_annotation_root_for_image(image_path: str) -> str | None:
+    cur = os.path.dirname(os.path.abspath(image_path))
+    while True:
+        ann = os.path.join(cur, "frame_annotations.jgz")
+        if os.path.exists(ann):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def _load_human4d_conditions_for_sources(source_paths: list[str], annotation_root: str = None) -> tuple[np.ndarray | None, np.ndarray | None, str | None]:
+    if not source_paths:
+        return None, None, None
+
+    # Prefer explicitly provided annotation root; fall back to auto-detection.
+    if annotation_root and os.path.isdir(annotation_root):
+        root = annotation_root
+        print(f"[GT cameras] Using user-provided annotation root: {root}")
+    else:
+        roots = [_find_annotation_root_for_image(p) for p in source_paths]
+        roots = [r for r in roots if r is not None]
+        if len(roots) != len(source_paths):
+            print("[GT cameras] Could not auto-detect annotation root from uploaded file paths (likely Gradio temp dir). Provide annotation root manually.")
+            return None, None, None
+        root = roots[0]
+        if any(r != root for r in roots):
+            return None, None, None
+        print(f"[GT cameras] Auto-detected annotation root: {root}")
+
+    ann_path = os.path.join(root, "frame_annotations.jgz")
+    try:
+        import gzip
+        with gzip.open(ann_path, "rt", encoding="utf-8") as f:
+            annotations = json.load(f)
+    except Exception:
+        return None, None, None
+
+    by_path = {}
+    by_name = {}
+    for item in annotations:
+        rel = item.get("image", {}).get("path")
+        if not rel:
+            continue
+        nrel = _normalize_path(rel)
+        by_path[nrel] = item
+        name = os.path.basename(nrel)
+        by_name.setdefault(name, []).append(item)
+
+    poses = []
+    intrinsics = []
+
+    for src in source_paths:
+        nsrc = _normalize_path(src)
+        matched = None
+
+        # Prefer robust suffix path match first.
+        for k, v in by_path.items():
+            if nsrc.endswith(k):
+                matched = v
+                break
+
+        # Fallback to basename only when unique.
+        if matched is None:
+            bname = os.path.basename(nsrc)
+            cands = by_name.get(bname, [])
+            if len(cands) == 1:
+                matched = cands[0]
+
+        if matched is None:
+            return None, None, None
+
+        vp = matched.get("viewpoint", {})
+        R = np.asarray(vp.get("R"), dtype=np.float32).reshape(3, 3)
+        T = np.asarray(vp.get("T"), dtype=np.float32).reshape(3)
+        fx, fy = vp.get("focal_length", [None, None])
+        cx, cy = vp.get("principal_point", [None, None])
+        if None in (fx, fy, cx, cy):
+            return None, None, None
+
+        w2c = np.eye(4, dtype=np.float32)
+        w2c[:3, :3] = R
+        w2c[:3, 3] = T
+        c2w = np.linalg.inv(w2c)
+
+        K = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+
+        print(f"  [{len(poses)}] {os.path.basename(src)}")
+        print(f"      R={R.tolist()}")
+        print(f"      T={T.tolist()}")
+        print(f"      fx={fx:.4f}  fy={fy:.4f}  cx={cx:.4f}  cy={cy:.4f}")
+
+        poses.append(c2w)
+        intrinsics.append(K)
+
+    print(f"Loaded GT camera parameters for {len(poses)} images from {ann_path}")
+    return np.stack(poses, axis=0), np.stack(intrinsics, axis=0), ann_path
+
 # -------------------------------------------------------------------------
 # 1) Core model inference
 # -------------------------------------------------------------------------
 # @spaces.GPU(duration=120)
-def run_model(target_dir, model) -> dict:
+def run_model(target_dir, model, conditions_path=None) -> dict:
     print(f"Processing images from {target_dir}")
 
     # Device check
@@ -295,11 +405,86 @@ def run_model(target_dir, model) -> dict:
 
     # 3. Infer
     print("Running model inference...")
-    dtype = torch.bfloat16
+    capability_major = torch.cuda.get_device_capability()[0]
+    preferred_dtype = torch.bfloat16 if capability_major >= 8 else torch.float16
+
+    use_conditions = isinstance(model, Pi3X) and conditions_path is not None and os.path.exists(conditions_path)
+    if use_conditions:
+        print(f"[run_model] Using GT camera conditions from: {conditions_path}")
+    else:
+        print("[run_model] No GT camera conditions — running unconditioned.")
+
     with torch.no_grad():
-        with torch.amp.autocast('cuda', dtype=dtype):
-            predictions = model(imgs[None]) # Add batch dimension
-    predictions['images'] = imgs[None].permute(0, 1, 3, 4, 2)
+        try:
+            with torch.amp.autocast('cuda', dtype=preferred_dtype):
+                if use_conditions:
+                    loaded = np.load(conditions_path, allow_pickle=True)
+                    conditions_np = {
+                        "poses": loaded["poses"] if "poses" in loaded else None,
+                        "intrinsics": loaded["intrinsics"] if "intrinsics" in loaded else None,
+                        "depths": loaded["depths"] if "depths" in loaded else None,
+                    }
+                    imgs_mm, conditions = load_multimodal_data(
+                        os.path.join(target_dir, "images"),
+                        conditions=conditions_np,
+                        interval=interval,
+                        device=device,
+                        verbose=False,
+                    )
+                    predictions = model(imgs=imgs_mm, **conditions)
+                    predictions['images'] = imgs_mm.permute(0, 1, 3, 4, 2)
+                else:
+                    predictions = model(imgs[None]) # Add batch dimension
+                    predictions['images'] = imgs[None].permute(0, 1, 3, 4, 2)
+        except RuntimeError as e:
+            if "No available kernel" not in str(e):
+                raise
+            print("SDPA kernel unavailable for current dtype/backend; retrying with safer settings...")
+            try:
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    if use_conditions:
+                        loaded = np.load(conditions_path, allow_pickle=True)
+                        conditions_np = {
+                            "poses": loaded["poses"] if "poses" in loaded else None,
+                            "intrinsics": loaded["intrinsics"] if "intrinsics" in loaded else None,
+                            "depths": loaded["depths"] if "depths" in loaded else None,
+                        }
+                        imgs_mm, conditions = load_multimodal_data(
+                            os.path.join(target_dir, "images"),
+                            conditions=conditions_np,
+                            interval=interval,
+                            device=device,
+                            verbose=False,
+                        )
+                        predictions = model(imgs=imgs_mm, **conditions)
+                        predictions['images'] = imgs_mm.permute(0, 1, 3, 4, 2)
+                    else:
+                        predictions = model(imgs[None])
+                        predictions['images'] = imgs[None].permute(0, 1, 3, 4, 2)
+            except RuntimeError:
+                # Last fallback: no autocast (fp32) to avoid SDPA backend kernel constraints.
+                if use_conditions:
+                    loaded = np.load(conditions_path, allow_pickle=True)
+                    conditions_np = {
+                        "poses": loaded["poses"] if "poses" in loaded else None,
+                        "intrinsics": loaded["intrinsics"] if "intrinsics" in loaded else None,
+                        "depths": loaded["depths"] if "depths" in loaded else None,
+                    }
+                    imgs_mm, conditions = load_multimodal_data(
+                        os.path.join(target_dir, "images"),
+                        conditions=conditions_np,
+                        interval=interval,
+                        device=device,
+                        verbose=False,
+                    )
+                    predictions = model(imgs=imgs_mm, **conditions)
+                    predictions['images'] = imgs_mm.permute(0, 1, 3, 4, 2)
+                else:
+                    predictions = model(imgs[None])
+                    predictions['images'] = imgs[None].permute(0, 1, 3, 4, 2)
+
+    if 'images' not in predictions:
+        predictions['images'] = imgs[None].permute(0, 1, 3, 4, 2)
     predictions['conf'] = torch.sigmoid(predictions['conf'])
     edge = depth_edge(predictions['local_points'][..., 2], rtol=0.03)
     predictions['conf'][edge] = 0.0
@@ -322,7 +507,7 @@ def run_model(target_dir, model) -> dict:
 # -------------------------------------------------------------------------
 # 2) Handle uploaded video/images --> produce target_dir + images
 # -------------------------------------------------------------------------
-def handle_uploads(input_video, input_images, interval=-1):
+def handle_uploads(input_video, input_images, interval=-1, annotation_root=None):
     """
     Create a new 'target_dir' + 'images' subfolder, and place user-uploaded
     images or extracted frames from video into it. Return (target_dir, image_paths).
@@ -343,6 +528,7 @@ def handle_uploads(input_video, input_images, interval=-1):
     os.makedirs(target_dir_images, exist_ok=True)
 
     image_paths = []
+    copy_records = []
 
     # --- Handle images ---
     if input_images is not None:
@@ -354,10 +540,16 @@ def handle_uploads(input_video, input_images, interval=-1):
                 file_path = file_data["name"]
             else:
                 file_path = file_data
-            dst_path = os.path.join(target_dir_images, os.path.basename(file_path))
+            base_name = os.path.basename(file_path)
+            dst_path = os.path.join(target_dir_images, base_name)
+            if os.path.exists(dst_path):
+                stem, ext = os.path.splitext(base_name)
+                dedup_id = len(copy_records)
+                dst_path = os.path.join(target_dir_images, f"{stem}_{dedup_id:04d}{ext}")
             shutil.copy(file_path, dst_path)
             image_paths.append(dst_path)
-        
+            copy_records.append((file_path, dst_path))
+
     # --- Handle video ---
     if input_video is not None:
         if isinstance(input_video, dict) and "name" in input_video:
@@ -383,29 +575,41 @@ def handle_uploads(input_video, input_images, interval=-1):
                 image_path = os.path.join(target_dir_images, f"{video_frame_num:06}.png")
                 cv2.imwrite(image_path, frame)
                 image_paths.append(image_path)
+                copy_records.append((image_path, image_path))
                 video_frame_num += 1
 
     # Sort final images for gallery
     image_paths = sorted(image_paths)
 
+    conditions_path = None
+    if copy_records:
+        sorted_records = sorted(copy_records, key=lambda x: x[1])
+        src_paths = [r[0] for r in sorted_records]
+        poses, intrinsics, ann_path = _load_human4d_conditions_for_sources(src_paths, annotation_root=annotation_root)
+        if poses is not None and intrinsics is not None:
+            conditions_path = os.path.join(target_dir, "conditions_auto.npz")
+            np.savez(conditions_path, poses=poses, intrinsics=intrinsics)
+            print(f"Auto-loaded GT cameras for {len(poses)} images from {ann_path}")
+
     end_time = time.time()
     print(f"Files copied to {target_dir_images}; took {end_time - start_time:.3f} seconds")
-    return target_dir, image_paths
+    return target_dir, image_paths, conditions_path
 
 
 # -------------------------------------------------------------------------
 # 3) Update gallery on upload
 # -------------------------------------------------------------------------
-def update_gallery_on_upload(input_video, input_images, interval=-1):
+def update_gallery_on_upload(input_video, input_images, interval=-1, annotation_root=None):
     """
     Whenever user uploads or changes files, immediately handle them
     and show in the gallery. Return (target_dir, image_paths).
     If nothing is uploaded, returns "None" and empty list.
     """
     if not input_video and not input_images:
-        return None, None, None, None
-    target_dir, image_paths = handle_uploads(input_video, input_images, interval=interval)
-    return None, target_dir, image_paths, "Upload complete. Click 'Reconstruct' to begin 3D processing."
+        return None, None, None, None, None
+    target_dir, image_paths, conditions_path = handle_uploads(input_video, input_images, interval=interval, annotation_root=annotation_root)
+    gt_status = f"Upload complete. GT cameras {'loaded ✅' if conditions_path else 'not found ❌ (check annotation root)'}. Click 'Reconstruct' to begin."
+    return None, target_dir, image_paths, gt_status, conditions_path
 
 
 # -------------------------------------------------------------------------
@@ -418,6 +622,9 @@ def gradio_demo(
     conf_thres=3.0,
     frame_filter="All",
     show_cam=True,
+    conditions_path=None,
+    use_gt_cameras=True,
+    annotation_root=None,
 ):
     """
     Perform reconstruction using the already-created target_dir/images.
@@ -435,9 +642,24 @@ def gradio_demo(
     all_files = [f"{i}: {filename}" for i, filename in enumerate(all_files)]
     frame_filter_choices = ["All"] + all_files
 
+    # If annotation_root is provided but conditions were not loaded at upload time, try loading now.
+    if use_gt_cameras and (not conditions_path or conditions_path == "None") and annotation_root and annotation_root.strip():
+        print(f"[gradio_demo] conditions_path missing; re-trying GT camera load from annotation_root={annotation_root}")
+        image_names = sorted(glob.glob(os.path.join(target_dir_images, "*")))
+        poses, intrinsics, ann_path = _load_human4d_conditions_for_sources(image_names, annotation_root=annotation_root.strip())
+        if poses is not None and intrinsics is not None:
+            conditions_path = os.path.join(target_dir, "conditions_auto.npz")
+            np.savez(conditions_path, poses=poses, intrinsics=intrinsics)
+            print(f"[gradio_demo] GT cameras loaded: {len(poses)} frames from {ann_path}")
+        else:
+            print("[gradio_demo] GT camera load still failed.")
+
+    effective_conditions_path = conditions_path if use_gt_cameras else None
+    print(f"[gradio_demo] use_gt_cameras={use_gt_cameras}, conditions_path={conditions_path}, effective={effective_conditions_path}")
+
     print("Running run_model...")
     with torch.no_grad():
-        predictions = run_model(target_dir, model)
+        predictions = run_model(target_dir, model, conditions_path=effective_conditions_path)
 
     # Save predictions
     prediction_save_path = os.path.join(target_dir, "predictions.npz")
@@ -543,6 +765,49 @@ def update_visualization(
     return glbfile, "Updating Visualization"
 
 
+def _detect_model_type_from_state_dict(state_dict: dict) -> str:
+    """Infer model type from checkpoint keys."""
+    keys = set(state_dict.keys())
+    # Pi3X has multimodal/metric branches that Pi3 does not have.
+    if any(k.startswith("depth_encoder.") for k in keys) or "metric_token" in keys or any(k.startswith("pose_inject_blk.") for k in keys):
+        return "pi3x"
+    return "pi3"
+
+
+def load_model(device: str, ckpt: str = None, repo_id: str = "yyfz233/Pi3") -> torch.nn.Module:
+    """Load Pi3/Pi3X from a local checkpoint when provided, otherwise fallback to HF repo."""
+    if ckpt is None:
+        default_ckpt = os.path.join("pretrained", "model.safetensors")
+        if os.path.exists(default_ckpt):
+            ckpt = default_ckpt
+
+    if ckpt is not None:
+        print(f"Loading weights from local checkpoint: {ckpt}")
+        if ckpt.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            weight = load_file(ckpt)
+        else:
+            weight = torch.load(ckpt, map_location=device, weights_only=False)
+
+        model_type = _detect_model_type_from_state_dict(weight)
+        if model_type == "pi3x":
+            print("Detected Pi3X checkpoint.")
+            model = Pi3X(use_multimodal=True).to(device).eval()
+        else:
+            print("Detected Pi3 checkpoint.")
+            model = Pi3().to(device).eval()
+
+        model.load_state_dict(weight, strict=True)
+        return model
+
+    if "pi3x" in repo_id.lower():
+        print(f"Loading Pi3X from Hugging Face repo: {repo_id}")
+        return Pi3X.from_pretrained(repo_id).to(device).eval()
+
+    print(f"Loading Pi3 from Hugging Face repo: {repo_id}")
+    return Pi3.from_pretrained(repo_id).to(device).eval()
+
+
 # -------------------------------------------------------------------------
 # Example images
 # -------------------------------------------------------------------------
@@ -562,16 +827,17 @@ skiing = "examples/skiing.mp4"
 
 if __name__ == '__main__':
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    parser = argparse.ArgumentParser(description="Run Pi3 Gradio demo")
+    parser.add_argument("--ckpt", type=str, default=None, help="Local checkpoint path (.safetensors or .pt).")
+    parser.add_argument("--repo_id", type=str, default="yyfz233/Pi3", help="HF repo id used when --ckpt is not provided.")
+    parser.add_argument("--device", type=str, default=None, help="Device override, e.g. cuda or cpu.")
+    args = parser.parse_args()
+
+    device = args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
 
     print("Initializing and loading Pi3 model...")
 
-    model = Pi3.from_pretrained("yyfz233/Pi3")
-    # model = Pi3()
-    # model.load_state_dict(torcdtype = torch.bfloat16h.load('ckpts/pi3.pt', weights_only=False, map_location=device))
-
-    model.eval()
-    model = model.to(device)
+    model = load_model(device=device, ckpt=args.ckpt, repo_id=args.repo_id)
 
     theme = gr.themes.Ocean()
     theme.set(
@@ -698,6 +964,7 @@ if __name__ == '__main__':
         is_example = gr.Textbox(label="is_example", visible=False, value="None")
         num_images = gr.Textbox(label="num_images", visible=False, value="None")
         target_dir_output = gr.Textbox(label="Target Dir", visible=False, value="None")
+        conditions_path_output = gr.Textbox(label="Conditions Path", visible=False, value="None")
 
         gr.HTML(
         """
@@ -779,12 +1046,17 @@ if __name__ == '__main__':
                     input_video = gr.Video(label="Upload Video", interactive=True)
                     input_images = gr.File(file_count="multiple", label="Or Upload Images", interactive=True)
                     interval = gr.Number(None, label='Frame/Image Interval', info="Sampling interval. Video default: 1 FPS. Image default: 1 (all images).")
+                    annotation_root_input = gr.Textbox(
+                        label="Annotation Root (directory containing frame_annotations.jgz)",
+                        placeholder="e.g. D:/data/human_body_4d_00",
+                        info="Required when GT camera poses cannot be auto-detected from the upload path (e.g. Gradio temp files). Leave blank to attempt auto-detection.",
+                        value="",
+                    )
                 
                 image_gallery = gr.Gallery(
                     label="Image Preview",
                     columns=4,
                     height="300px",
-                    show_download_button=True,
                     object_fit="contain",
                     preview=True,
                 )
@@ -805,11 +1077,12 @@ if __name__ == '__main__':
                     with gr.Row():
                         conf_thres = gr.Slider(minimum=0, maximum=100, value=20, step=0.1, label="Confidence Threshold (%)")
                         show_cam = gr.Checkbox(label="Show Cameras", value=True)
+                    with gr.Row():
+                        use_gt_cameras = gr.Checkbox(label="Use GT Camera Poses (auto-detected from frame_annotations.jgz)", value=True)
                     frame_filter = gr.Dropdown(choices=["All"], value="All", label="Show Points from Frame")
 
         # Set clear button targets
-        clear_btn.add([input_video, input_images, reconstruction_output, log_output, target_dir_output, image_gallery, interval])
-
+        clear_btn.add([input_video, input_images, reconstruction_output, log_output, target_dir_output, image_gallery, interval, conditions_path_output])
         # ---------------------- Examples section ----------------------
         examples = [
             [skating, None, 10, 20, True],
@@ -835,7 +1108,7 @@ if __name__ == '__main__':
             3) Return model3D + logs + new_dir + updated dropdown + gallery
             We do NOT return is_example. It's just an input.
             """
-            target_dir, image_paths = handle_uploads(input_video, input_images, interval)
+            target_dir, image_paths, _ = handle_uploads(input_video, input_images, interval)
             # Always use "All" for frame_filter in examples
             frame_filter = "All"
             glbfile, log_msg, dropdown = gradio_demo(
@@ -868,6 +1141,9 @@ if __name__ == '__main__':
         #  - gradio_demo(...) with the existing target_dir
         #  - Then set is_example = "False"
         # -------------------------------------------------------------------------
+        def _maybe_conditions_path(use_gt, cpath):
+            return cpath if use_gt else None
+
         submit_btn.click(fn=clear_fields, inputs=[], outputs=[reconstruction_output]).then(
             fn=update_log, inputs=[], outputs=[log_output]
         ).then(
@@ -877,9 +1153,12 @@ if __name__ == '__main__':
                 conf_thres,
                 frame_filter,
                 show_cam,
-            ],
-            outputs=[reconstruction_output, log_output, frame_filter],
-        ).then(
+                conditions_path_output,
+                use_gt_cameras,
+                annotation_root_input,
+             ],
+             outputs=[reconstruction_output, log_output, frame_filter],
+         ).then(
             fn=lambda: "False", inputs=[], outputs=[is_example]  # set is_example to "False"
         )
 
@@ -926,13 +1205,13 @@ if __name__ == '__main__':
         # -------------------------------------------------------------------------
         input_video.change(
             fn=update_gallery_on_upload,
-            inputs=[input_video, input_images, interval],
-            outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
+            inputs=[input_video, input_images, interval, annotation_root_input],
+            outputs=[reconstruction_output, target_dir_output, image_gallery, log_output, conditions_path_output],
         )
         input_images.change(
             fn=update_gallery_on_upload,
-            inputs=[input_video, input_images, interval],
-            outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
+            inputs=[input_video, input_images, interval, annotation_root_input],
+            outputs=[reconstruction_output, target_dir_output, image_gallery, log_output, conditions_path_output],
         )
 
     demo.queue(max_size=20).launch(show_error=True, share=True)

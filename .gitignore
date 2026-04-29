@@ -22,4 +22,5 @@ ckpts
 /utils/utils_ceph.py
 
 resize_demo_imgs.py
-img_dir_to_video.py
+pretrained/
+examples/
