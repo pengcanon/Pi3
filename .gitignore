@@ -24,3 +24,5 @@ ckpts
 resize_demo_imgs.py
 pretrained/
 examples/
+*.glb
+.gradio
